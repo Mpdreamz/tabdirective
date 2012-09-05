@@ -8,6 +8,8 @@ using Microsoft.VisualStudio.Text.Operations;
 using Microsoft.VisualStudio.Utilities;
 using EnvDTE;
 using System.IO;
+using System.Linq;
+using System.Collections.Generic;
 
 namespace TabDirective
 {
@@ -25,6 +27,8 @@ namespace TabDirective
         bool _dontShowAgain = false;
 
         private readonly TabDirectiveParser _tabDirectiveParser;
+        private readonly FileHeuristics _fileHeuristics;
+        private readonly InformationBarControl _informationBarControl;
 
         public InformationBarMargin(IWpfTextView textView, ITextDocument document, IEditorOperations editorOperations, ITextUndoHistory undoHistory, DTE dte)
         {
@@ -34,14 +38,14 @@ namespace TabDirective
             _undoHistory = undoHistory;
             _dte = dte;
 
-            var informationBar = new InformationBarControl();
-            informationBar.Tabify.Click += Tabify;
-            informationBar.Untabify.Click += Untabify;
-            informationBar.Hide.Click += Hide;
-            informationBar.DontShowAgain.Click += DontShowAgain;
+            _informationBarControl = new InformationBarControl();
+            _informationBarControl.Hide.Click += Hide;
+            _informationBarControl.DontShowAgain.Click += DontShowAgain;
+            var format = new Action(() => this.FormatDocument());
+            _informationBarControl.Tabify.Click += (s, e) => this.Dispatcher.Invoke(format);
 
             this.Height = 0;
-            this.Content = informationBar;
+            this.Content = _informationBarControl;
             this.Name = MarginName;
 
             document.FileActionOccurred += FileActionOccurred;
@@ -51,7 +55,10 @@ namespace TabDirective
             textView.GotAggregateFocus += GotAggregateFocus;
 
             this._tabDirectiveParser = new TabDirectiveParser(textView, document, dte);
+            this._fileHeuristics = new FileHeuristics(textView, document, dte);
 
+            var fix = new Action(() => this.FixFile());
+            this._tabDirectiveParser.Change += (s, e) => this.Dispatcher.Invoke(fix);
         }
 
         void DisableInformationBar()
@@ -73,72 +80,39 @@ namespace TabDirective
             }
         }
 
-        
 
-        void CheckTabsAndSpaces()
+        void FixFile()
         {
-            this._tabDirectiveParser.UpdateTabSettings();
+            var message = string.Empty;
+            var fh = this._fileHeuristics;
+            var tp = this._tabDirectiveParser;
+            this._fileHeuristics.Parse();
+            if (fh.StartsWithSpace && fh.StartsWithTabs)
+                message = "This file contains mixed tabs and spaces";
+            else if (fh.StartsWithSpace && tp.InsertTabs)
+                message = "This file seems to be using spaces while the tabdirective mandates tabs";
+            else if (fh.StartsWithTabs && !tp.InsertTabs)
+                message = "This file seems to be using tabs while the tabdirective mandates spaces of indentsize: " + tp.IndentSize;
+            else if (fh.StartsWithSpace && fh.GuessedIndentSize != tp.IndentSize)
+                message = string.Format("This file seems to be using indentsize: {0} while the tabdirective mandates: {1}",
+                    fh.GuessedIndentSize, tp.IndentSize);
 
-
-            if (this._tabDirectiveParser.InsertTabs)
-                this.Tabify();
-            else
-                this.Untabify();
-
-            if (_dontShowAgain)
+            if (string.IsNullOrWhiteSpace(message))
                 return;
-            
-            ITextSnapshot snapshot = _textView.TextDataModel.DocumentBuffer.CurrentSnapshot;
 
-            int tabSize = _textView.Options.GetOptionValue(DefaultOptions.TabSizeOptionId);
-
-            bool startsWithSpaces = false;
-            bool startsWithTabs = false;
-
-            foreach (var line in snapshot.Lines)
-            {
-                if (line.Length > 0)
-                {
-                    char firstChar = line.Start.GetChar();
-                    if (firstChar == '\t')
-                        startsWithTabs = true;
-                    else if (firstChar == ' ')
-                    {
-                        // We need to count to make sure there are enough spaces to go into a tab or a tab that follows the spaces
-                        int countOfSpaces = 1;
-                        for (int i = line.Start + 1; i < line.End; i++)
-                        {
-                            char ch = snapshot[i];
-                            if (ch == ' ')
-                            {
-                                countOfSpaces++;
-                                if (countOfSpaces >= tabSize)
-                                {
-                                    startsWithSpaces = true;
-                                    break;
-                                }
-                            }
-                            else if (ch == '\t')
-                            {
-                                startsWithSpaces = true;
-                                break;
-                            }
-                            else
-                            {
-                                break;
-                            }
-                        }
-                    }
-
-                    if (startsWithSpaces && startsWithTabs)
-                        break;
-                }
-            }
-
-            if (startsWithTabs && startsWithSpaces)
-                ShowInformationBar();
+            _informationBarControl.Message.Text = message;
+            this.ShowInformationBar();
         }
-      
+        void FormatDocument()
+        {
+            PerformActionInUndo(() =>
+            {
+                _textView.VisualElement.Focus();
+                _dte.ExecuteCommand("Edit.FormatDocument");
+                this.CloseInformationBar();
+                return true;
+            });
+        }
 
         #region Event Handlers
 
@@ -150,7 +124,7 @@ namespace TabDirective
             if ((e.FileActionType & FileActionTypes.ContentLoadedFromDisk) != 0 ||
                 (e.FileActionType & FileActionTypes.ContentSavedToDisk) != 0)
             {
-                CheckTabsAndSpaces();
+                this._tabDirectiveParser.UpdateTabSettings();
             }
         }
 
@@ -158,7 +132,7 @@ namespace TabDirective
         {
             _textView.GotAggregateFocus -= GotAggregateFocus;
 
-            CheckTabsAndSpaces();
+            this._tabDirectiveParser.UpdateTabSettings();
         }
 
         void TextViewClosed(object sender, EventArgs e)
@@ -223,135 +197,8 @@ namespace TabDirective
 
         #endregion
 
+     
         #region Performing Tabify and Untabify
-        void Tabify()
-        {
-            Tabify(null, null);
-        }
-        void Tabify(object sender, RoutedEventArgs e)
-        {
-            PerformActionInUndo(() =>
-            {
-                int tabSize = _textView.Options.GetOptionValue(DefaultOptions.TabSizeOptionId);
-
-                using (ITextEdit edit = _textView.TextBuffer.CreateEdit())
-                {
-                    foreach (var line in edit.Snapshot.Lines)
-                    {
-                        bool tabsAfterSpaces = false;
-                        int column = 0;
-                        int spanLength = 0;
-                        int countOfLargestRunOfSpaces = 0;
-                        int countOfCurrentRunOfSpaces = 0;
-
-                        for (int i = line.Start; i < line.End; i++)
-                        {
-                            char ch = edit.Snapshot[i];
-
-                            // Increment column or break, depending on the character
-                            if (ch == ' ')
-                            {
-                                countOfCurrentRunOfSpaces++;
-                                countOfLargestRunOfSpaces = Math.Max(countOfLargestRunOfSpaces, countOfCurrentRunOfSpaces);
-
-                                column++;
-                                spanLength++;
-                            }
-                            else if (ch == '\t')
-                            {
-                                if (countOfLargestRunOfSpaces > 0)
-                                    tabsAfterSpaces = true;
-
-                                countOfCurrentRunOfSpaces = 0;
-
-                                column += tabSize - (column % tabSize);
-                                spanLength++;
-                            }
-                            else
-                            {
-                                break;
-                            }
-                        }
-
-                        // Only do a replace if this will have any effect
-                        if (tabsAfterSpaces || countOfLargestRunOfSpaces >= tabSize)
-                        {
-                            int tabCount = column / tabSize;
-                            int spaceCount = column % tabSize;
-
-                            string newWhitespace = string.Format("{0}{1}",
-                                                                 new string('\t', tabCount),
-                                                                 new string(' ', spaceCount));
-
-                            if (!edit.Replace(new Span(line.Start, spanLength), newWhitespace))
-                                return false;
-                        }
-                    }
-
-                    edit.Apply();
-                    return !edit.Canceled;
-                }
-            });
-
-            this.CloseInformationBar();
-        }
-        void Untabify()
-        {
-            Untabify(null, null);
-        }
-        void Untabify(object sender, RoutedEventArgs e)
-        {
-            PerformActionInUndo(() =>
-            {
-                int tabSize = _textView.Options.GetOptionValue(DefaultOptions.TabSizeOptionId);
-
-                using (ITextEdit edit = _textView.TextBuffer.CreateEdit())
-                {
-                    foreach (var line in edit.Snapshot.Lines)
-                    {
-                        bool hasTabs = false;
-                        int column = 0;
-                        int spanLength = 0;
-
-                        for (int i = line.Start; i < line.End; i++)
-                        {
-                            char ch = edit.Snapshot[i];
-
-                            if (ch == '\t')
-                            {
-                                hasTabs = true;
-
-                                column += tabSize - (column % tabSize);
-                                spanLength++;
-                            }
-                            else if (ch == ' ')
-                            {
-                                spanLength++;
-                                column++;
-                            }
-                            else
-                            {
-                                break;
-                            }
-                        }
-
-                        // Only do a replace if this will have any effect
-                        if (hasTabs)
-                        {
-                            string newWhitespace = new string(' ', column);
-
-                            if (!edit.Replace(new Span(line.Start, spanLength), newWhitespace))
-                                return false;
-                        }
-                    }
-
-                    edit.Apply();
-                    return !edit.Canceled;
-                }
-            });
-
-            this.CloseInformationBar();
-        }
 
         void PerformActionInUndo(Func<bool> action)
         {
@@ -372,9 +219,9 @@ namespace TabDirective
 
                 ITextSnapshot after = _textView.TextSnapshot;
 
-                _operations.SelectAndMoveCaret(new VirtualSnapshotPoint(anchor.GetPoint(after)), 
-                                               new VirtualSnapshotPoint(active.GetPoint(after)), 
-                                               mode, 
+                _operations.SelectAndMoveCaret(new VirtualSnapshotPoint(anchor.GetPoint(after)),
+                                               new VirtualSnapshotPoint(active.GetPoint(after)),
+                                               mode,
                                                EnsureSpanVisibleOptions.ShowStart);
 
                 _operations.AddAfterTextBufferChangePrimitive();
@@ -423,6 +270,7 @@ namespace TabDirective
 
         public void Dispose()
         {
+            this._tabDirectiveParser.Dispose();
             this.DisableInformationBar();
         }
 

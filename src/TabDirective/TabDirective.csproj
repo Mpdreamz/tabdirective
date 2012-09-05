@@ -75,6 +75,7 @@
     <Reference Include="WindowsBase" />
   </ItemGroup>
   <ItemGroup>
+    <None Include=".tab.directive" />
     <None Include="source.extension.vsixmanifest">
       <SubType>Designer</SubType>
     </None>
@@ -82,17 +83,16 @@
   <ItemGroup>
     <Content Include="fix-mixed-tabs-icon.png">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-      <IncludeInVSIX>true</IncludeInVSIX>
     </Content>
     <Content Include="fix-mixed-tabs-screenshot.png">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-      <IncludeInVSIX>true</IncludeInVSIX>
     </Content>
   </ItemGroup>
   <ItemGroup>
     <Folder Include="Properties\" />
   </ItemGroup>
   <ItemGroup>
+    <Compile Include="FileHeuristics.cs" />
     <Compile Include="InformationBar.cs" />
     <Compile Include="InformationBar.xaml.cs">
       <DependentUpon>InformationBar.xaml</DependentUpon>

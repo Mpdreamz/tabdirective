@@ -11,32 +11,86 @@ using System.Text.RegularExpressions;
 
 namespace TabDirective
 {
-    public class TabDirectiveParser
+    public class TabDirectiveParser : IDisposable
     {
         private readonly IWpfTextView _textView;
         private readonly ITextDocument _document;
         private readonly DTE _dte;
+
+        private string _directivePath;
+        private FileSystemWatcher _directiveWatcher;
 
         public int TabSize { get; set; }
         public int IndentSize { get; set; }
         public string IndentStyle { get; set; }
         public bool InsertTabs { get; set; }
 
+        public delegate void ChangedHandler(TabDirectiveParser sender, EventArgs data);
+        public event ChangedHandler Change = (s, d) => { };
+
+        private bool _ranOnce = false;
+
         public TabDirectiveParser(IWpfTextView textView, ITextDocument document, DTE dte)
         {
             this._document = document;
             this._textView = textView;
             this._dte = dte;
+            if (this.SetDirectiveFile())
+                this.SetWatcher();
+
+        }
+
+        private bool SetDirectiveFile()
+        {
+            this._directivePath = this.GetTabDirectivesFile();
+            return !string.IsNullOrWhiteSpace(this._directivePath);
+        }
+
+        private void SetWatcher()
+        {
+            var info = new FileInfo(this._directivePath);
+            if (this._directiveWatcher != null && this._directiveWatcher.Path == info.DirectoryName)
+                return;
+            if (this._directiveWatcher != null)
+            {
+                this._directiveWatcher.EnableRaisingEvents = false;
+                this._directiveWatcher.Dispose();
+                this._directiveWatcher = null;
+            }
+
+            this._directiveWatcher = new FileSystemWatcher();
+            this._directiveWatcher.Path = info.DirectoryName;
+            this._directiveWatcher.Filter = Path.GetFileName(this._directivePath);
+            this._directiveWatcher.NotifyFilter =
+                NotifyFilters.LastAccess | NotifyFilters.LastWrite | NotifyFilters.FileName | NotifyFilters.DirectoryName | NotifyFilters.Size;
+            this._directiveWatcher.Changed += (s, e) => this.UpdateTabSettings();
+            this._directiveWatcher.Deleted += (s, e) => this._directivePath = null;
+            this._directiveWatcher.EnableRaisingEvents = true;
         }
 
         public void UpdateTabSettings()
         {
-            var directivesFile = this.GetTabDirectivesFile();
-            if (string.IsNullOrWhiteSpace(directivesFile))
+            if (string.IsNullOrWhiteSpace(this._directivePath))
+            {
+                if (this.SetDirectiveFile())
+                    this.SetWatcher();
+            }
+
+            if (string.IsNullOrWhiteSpace(this._directivePath))
                 return;
-            var directives = this.ParseFileDirectives(directivesFile);
+
+
+            var directives = this.ParseFileDirectives();
             if (directives == null || !directives.Any())
                 return;
+
+            
+            var currentIndentSize = this.IndentSize;
+            var currentTabSize = this.TabSize;
+            var currentInsertTabs = this.InsertTabs;
+            var currentIndentStyle = this.IndentStyle;
+
+            var allLanguageProps = this._dte.Properties["TextEditor", "AllLanguages"];
 
             if (directives.ContainsKey("indentstyle"))
             {
@@ -44,13 +98,13 @@ namespace TabDirective
                 switch (this.IndentStyle.ToLowerInvariant())
                 {
                     case "smart":
-                        this._dte.Properties["TextEditor", "AllLanguages"].Item("TabSize").Value = vsIndentStyle.vsIndentStyleSmart;
+                        allLanguageProps.Item("IndentStyle").Value = vsIndentStyle.vsIndentStyleSmart;
                         break;
                     case "none":
-                        this._dte.Properties["TextEditor", "AllLanguages"].Item("TabSize").Value = vsIndentStyle.vsIndentStyleNone;
+                        allLanguageProps.Item("IndentStyle").Value = vsIndentStyle.vsIndentStyleNone;
                         break;
                     default:
-                        this._dte.Properties["TextEditor", "AllLanguages"].Item("TabSize").Value = vsIndentStyle.vsIndentStyleDefault;
+                        allLanguageProps.Item("IndentStyle").Value = vsIndentStyle.vsIndentStyleDefault;
                         break;
                 }
             }
@@ -59,7 +113,7 @@ namespace TabDirective
                 int tabSize;
                 if (int.TryParse(directives["tabsize"], out tabSize))
                 {
-                    this._dte.Properties["TextEditor", "AllLanguages"].Item("TabSize").Value = tabSize;
+                    allLanguageProps.Item("TabSize").Value = tabSize;
                     this.TabSize = tabSize;
                 }
 
@@ -69,7 +123,7 @@ namespace TabDirective
                 int indentSize;
                 if (int.TryParse(directives["indentsize"], out indentSize))
                 {
-                    this._dte.Properties["TextEditor", "AllLanguages"].Item("IndentSize").Value = indentSize;
+                    allLanguageProps.Item("IndentSize").Value = indentSize;
                     this.IndentSize = indentSize;
                 }
             }
@@ -78,13 +132,20 @@ namespace TabDirective
                 bool insertTabs;
                 if (bool.TryParse(directives["inserttabs"], out insertTabs))
                 {
-                    this._dte.Properties["TextEditor", "AllLanguages"].Item("InsertTabs").Value = insertTabs;
+                    allLanguageProps.Item("InsertTabs").Value = insertTabs;
                     this.InsertTabs = insertTabs;
                 }
             }
-            _textView.VisualElement.UpdateLayout();
+
+
+            if (_ranOnce && currentIndentSize != this.IndentSize
+                || currentTabSize != this.TabSize
+                || currentInsertTabs != this.InsertTabs)
+                Change(this, null);
+            else Change(this, null);
+            
+            _ranOnce = true;
         }
-        
 
         private string GetTabDirectivesFile()
         {
@@ -109,6 +170,7 @@ namespace TabDirective
                 directivePath = this.FindDirectiveFileInFolder(_dte.Solution.FullName);
             return directivePath;
         }
+
         private string FindDirectiveFileInFolder(string fileName)
         {
             var dirInfo = new FileInfo(fileName);
@@ -120,10 +182,13 @@ namespace TabDirective
             return null;
         }
 
-        private Dictionary<string, string> ParseFileDirectives(string filePath)
+        private Dictionary<string, string> ParseFileDirectives()
         {
             var directives = new Dictionary<string, string>();
-            var inputFileContent = File.ReadAllText(filePath);
+            if (string.IsNullOrWhiteSpace(this._directivePath))
+                return directives;
+
+            var inputFileContent = this.ReadAll();
             var regex = new Regex(@"\b(?<Key>\w+)\s*:\s*(?<Value>[~\\\/\w\.]+)\b", RegexOptions.ExplicitCapture);
             foreach (Match item in regex.Matches(inputFileContent))
             {
@@ -134,6 +199,29 @@ namespace TabDirective
             return directives;
         }
 
+        private string ReadAll()
+        {
+            using (var fs = new FileStream(this._directivePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+            using (var textReader = new StreamReader(fs))
+            {
+                return textReader.ReadToEnd();
+            }
+        }
 
+
+        public void Dispose()
+        {
+            Dispose(true);
+        }
+        protected void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                if (this._directiveWatcher != null)
+                {
+                    this._directiveWatcher.Dispose();
+                }
+            }
+        }       
     }
 }
